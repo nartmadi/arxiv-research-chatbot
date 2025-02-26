@@ -1,28 +1,42 @@
 import json
 import faiss
 import numpy as np
+import time
+import psutil
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 
-# Config
-JSON_FILE = '../data/arxiv_dataset.json'
-EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
-FAISS_INDEX_FILE = '../data/arxiv_dataset.index'
-METADATA_FILE = "../data/arxiv_metadata.json"
+INPUT_DIR = "../data/arxiv-dataset"
+OUTPUT_DIR = "../data"
 
-# Load Sentence-BERT model
-model = SentenceTransformer(EMBEDDING_MODEL)
+JSON_FILE = f"{INPUT_DIR}/arxiv_dataset.json"
+FAISS_FLATL2_INDEX_FILE = f"{OUTPUT_DIR}/arxiv_flatl2.index"
+FAISS_IVF_INDEX_FILE = f"{OUTPUT_DIR}/arxiv_ivf.index"
+FAISS_HNSW_INDEX_FILE = f"{OUTPUT_DIR}/arxiv_hnsw.index"
+METADATA_FILE = f"{OUTPUT_DIR}/arxiv_metadata.json"
 
-# Initialize FAISS index
+NUM_QUERIES = 100
+NUM_CLUSTERS = 4096
+NUM_NEIGHBORS = 10
+BATCH_SIZE = 32
+
+print("Loading Sentence-BERT model...")
+model = SentenceTransformer("all-MiniLM-L6-v2")
 embedding_dim = model.get_sentence_embedding_dimension()
-faiss_index = faiss.IndexFlatL2(embedding_dim)
 
-# Process JSON file
+print("Initializing FAISS GPU resources...")
+gpu_res = faiss.StandardGpuResources()
+
+# Process dataset
 metadata_store = {}
 paper_ids = []
+embeddings = []
+batch_texts = []
+
+print("Processing JSON file and generating embeddings...")
 
 with open(JSON_FILE, 'r', encoding='utf-8') as file:
-    for paper in tqdm(file, desc='Processing Paper'):
+    for paper in tqdm(file, desc='Processing Papers'):
         try:
             data = json.loads(paper)
 
@@ -41,10 +55,8 @@ with open(JSON_FILE, 'r', encoding='utf-8') as file:
             if not abstract or not title:
                 continue
 
-            embedding = model.encode(abstract, convert_to_numpy=True, normalize_embeddings=True)
-
-            faiss_index.add(np.array([embedding], dtype=np.float32))
-
+            batch_texts.append(abstract)
+            paper_ids.append(paper_id)
             metadata_store[paper_id] = {
                 'title': title,
                 'abstract': abstract,
@@ -54,14 +66,39 @@ with open(JSON_FILE, 'r', encoding='utf-8') as file:
                 'doi': doi,
                 'update_date': update_date
             }
-            paper_ids.append(paper_id)
+
+            if len(batch_texts) >= BATCH_SIZE:
+                batch_embeddings = model.encode(batch_texts, convert_to_numpy=True, normalize_embeddings=True)
+                embeddings.extend(batch_embeddings)
+                batch_texts = []
+
         except json.JSONDecodeError:
             print('Skipping invalid JSON paper entry')
 
-faiss.write_index(faiss_index, FAISS_INDEX_FILE)
+if batch_texts:
+    batch_embeddings = model.encode(batch_texts, convert_to_numpy=True, normalize_embeddings=True)
+    embeddings.extend(batch_embeddings)
+
+embeddings = np.array(embeddings, dtype=np.float32)
+
+query_vectors = np.random.rand(NUM_QUERIES, embedding_dim).astype("float32")
+
+quantizer = faiss.IndexFlatL2(embedding_dim)
+faiss_ivf = faiss.IndexIVFFlat(quantizer, embedding_dim, NUM_CLUSTERS, faiss.METRIC_L2)
+
+print("\n🔹 Training FAISS IVFFlat (Clustered FAISS Index)...")
+faiss_ivf.train(embeddings[:100_000])
+faiss_ivf.add(embeddings)
+
+faiss.write_index(faiss.index_gpu_to_cpu(faiss_ivf), FAISS_IVF_INDEX_FILE)
+print("✅ FAISS IVFFlat index saved successfully!")
+
+print("Saving full metadata...")
 
 with open(METADATA_FILE, 'w', encoding='utf-8') as file:
     for paper_id in paper_ids:
         entry = metadata_store[paper_id]
         entry['id'] = paper_id
         file.write(json.dumps(entry) + '\n')
+
+print("✅ Full metadata saved successfully!")
